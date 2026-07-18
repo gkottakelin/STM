@@ -4,7 +4,7 @@
 
 ### 1.配置调试引脚
 
-  <img src="file:///C:/Users/ASUS/AppData/Roaming/marktext_specialedition/images/2026-07-18-18-34-52-image.png" title="" alt="" width="474">、
+  <img src="file:///C:/Users/ASUS/AppData/Roaming/marktext_specialedition/images/2026-07-18-18-34-52-image.png" title="" alt="" width="474">
 
 ### 2.配置主频
 
