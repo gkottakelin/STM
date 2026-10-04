@@ -1,49 +1,29 @@
 # MDK 程序移植到 STM32CubeIDE 指南——以实验13为例
 
-> 适用对象：已经有一个可用的 STM32CubeIDE 目标工程，需要把 MDK-ARM（Keil）工程中的程序迁入其中。  
-> 本文不讲如何新建 STM32CubeIDE 工程，也不直接创建实验13的 CubeIDE 工程；重点是移植时怎样分析、怎样取舍、需要配置什么、为什么这样配置，以及出现问题时怎样逐层定位。
+适用于已有 STM32CubeIDE 目标工程、需要迁入 MDK-ARM（Keil）程序的情况。本文以实验13为例，按“保留原 HAL/CMSIS 和驱动、复制源码、适配 GNU 工具链”的路线完成首次移植。
 
----
+操作顺序：**确认原程序可运行 → 准备文件 → 配置工程 → 修改编译器相关代码 → 编译下载 → 分阶段验证**。首次迁移先保持原驱动和目录结构，运行通过后再考虑升级 HAL 或重构。
 
-## 1. 先明确“移植”的真正含义
+## 1. 适用范围与准备条件
 
-MDK 工程不是一组可以被另一个 IDE 原样打开的源文件。一个可执行程序实际由以下几层共同决定：
+| 项目 | 本文使用的配置 |
+| --- | --- |
+| 原工程 | 实验13 TFTLCD（MCU屏）实验，`Projects/MDK-ARM/atk_f103.uvprojx` |
+| MCU | STM32F103ZE，CubeIDE 中对应 STM32F103ZETx；Cortex-M3，无 FPU |
+| 内存 | Flash：`0x08000000`，512 KiB；SRAM：`0x20000000`，64 KiB |
+| 原编译器 | ARM Compiler 5.06 update 7，C99，MDK Level 1 优化 |
+| 时钟 | 板载 8 MHz HSE，经 PLL × 9 得到 72 MHz |
+| LCD | FSMC Bank1 NE4，16 位 8080 MCU 并口屏，A10 作为 RS；不适用于 RGB 屏 |
 
-1. **目标芯片和内存布局**：芯片型号、Flash/RAM 起始地址和容量、栈、堆、中断向量表位置。
-2. **启动过程**：复位后设置栈、执行 `SystemInit()`、初始化 C 运行库、进入 `main()`。
-3. **编译条件**：全局宏、头文件搜索路径、C 语言标准、优化级别、编译器扩展。
-4. **参与构建的文件集合**：不是目录里所有 `.c` 文件，而是 MDK 工程实际勾选并编译的那些文件。
-5. **链接和运行库**：链接脚本、标准库、半主机、`printf` 重定向、未使用段删除规则。
-6. **下载和调试**：调试探针、下载地址、复位方式和调试接口。
-7. **板级行为**：外部晶振、引脚、电源、外部总线时序和外设型号。
+其他 STM32 型号需重新核对芯片容量、启动文件、HAL 接口、FSMC/FMC 功能和引脚映射，本文配置不能直接保证适用。
 
-因此，移植的本质不是“把文件复制进 IDE”，而是把 MDK 中隐含的构建契约重新表达为 STM32CubeIDE/GNU 工具链能够理解的形式。
+开始前确认原 MDK 工程可编译，并确认原 `Output/atk_f103.hex` 能在当前板卡和屏幕上运行。记录 LCD 型号及 ID、串口输出、LED 周期和接线，作为移植后的对照；若原程序也不能运行，先排查硬件和原工程。
 
-一个可靠的迁移顺序应当是：
+## 2. 准备与筛选文件
 
-```text
-确认 MDK 基线可用
-        ↓
-提取 MDK 构建契约
-        ↓
-建立 CubeIDE 中等价的启动/链接环境
-        ↓
-只加入实际参与构建的源文件
-        ↓
-处理 ARMCC 与 GCC 的差异
-        ↓
-先通过编译和链接
-        ↓
-按“时钟→LED→串口→FSMC→LCD”顺序验证运行
-```
+### 2.1 复制源码并确定库来源
 
-不要一开始同时改目录结构、更新 HAL 版本、改用 CubeMX 生成的外设初始化、重写驱动并迁移编译器。变量越多，越难判断故障属于哪一层。
-
----
-
-## 2. 实验13的已知基线
-
-本文依据以下原始工程进行分析：
+原工程位于本指南同目录下的：
 
 ```text
 2，标准例程-HAL库版本/
@@ -56,48 +36,13 @@ MDK 工程不是一组可以被另一个 IDE 原样打开的源文件。一个�
    └─ readme.txt
 ```
 
-从 `atk_f103.uvprojx` 和实验源码可以得到下列事实：
+将所需源码和头文件复制到目标工程，保持原 `Drivers/`、`User/` 的相对结构。目标工程采用实验13自带的 CMSIS、HAL、SYSTEM、BSP 和 `User/stm32f1xx_hal_conf.h`；CubeIDE 原有的同类实现不再参与构建或头文件搜索。
 
-| 项目        | 原 MDK 工程配置                            |
-| --------- | ------------------------------------- |
-| Target 名称 | `TFTLCD`                              |
-| MCU       | `STM32F103ZE`                         |
-| 内核        | Cortex-M3，无 FPU                       |
-| Flash     | `0x08000000`，512 KiB                  |
-| SRAM      | `0x20000000`，64 KiB                   |
-| MDK 编译器   | ARM Compiler 5.06 update 7，非 AC6      |
-| C 标准      | 启用 C99                                |
-| 优化        | MDK Level 1                           |
-| 全局宏       | `USE_HAL_DRIVER`、`STM32F103xE`        |
-| 输出        | `atk_f103`，生成 HEX                     |
-| 主时钟       | 板载 8 MHz HSE，经 PLL × 9 得到 72 MHz      |
-| 串口        | USART1，PA9/PA10，115200 bit/s          |
-| LCD 接口    | FSMC Bank1 NE4，16 位 8080 并口，A10 作为 RS |
+**整个工程只使用一套 HAL/CMSIS。** 不要直接把旧库覆盖到新库上形成混合目录。保留目标芯片对应的 GNU 启动文件和 `.ld` 链接脚本，并按第3章核对。需要共享原文件时，参见附录 A。
 
-原程序的可观察现象是：
+### 2.2 加入实际参与构建的源文件
 
-- LCD 循环切换 12 种背景色并显示固定字符串和 LCD 控制器 ID；
-- LED0 每约 1 秒翻转一次；
-- 复位后串口输出一次 LCD ID；
-- 支持的是 MCU 并口屏，不是 RGB 屏。
-
-这些现象就是移植验收标准。仅仅做到“0 Error”不能算移植完成。
-
----
-
-## 3. 移植前先做一张“构建清单”
-
-### 3.1 以 `.uvprojx` 为准，不以磁盘目录为准
-
-实验13目录中有大量 HAL 源文件，但 MDK 工程只编译其中一小部分。如果把整个 `Drivers/STM32F1xx_HAL_Driver/Src` 目录直接放进 CubeIDE 的自动构建范围，可能引入：
-
-- 不需要的外设驱动；
-- HAL 模板文件；
-- Legacy 与当前实现并存；
-- 额外的 MSP、时基或中断实现；
-- 编译时间增加和重复符号。
-
-实验13的 MDK 工程实际参与构建的 C 文件如下。
+以 `.uvprojx` 中的文件清单为准。实验13实际参与构建的 C 文件如下；不要把 HAL 目录中的模板、Legacy 或其他未使用实现一并加入。
 
 #### 用户和系统层
 
@@ -133,133 +78,27 @@ Drivers/BSP/LED/led.c
 Drivers/BSP/LCD/lcd.c
 ```
 
-对应的头文件不需要作为独立编译单元，但必须能通过头文件搜索路径找到，尤其是：
+同时保留这些源文件所需的头文件，尤其是 `User/stm32f1xx_hal_conf.h`、`User/stm32f1xx_it.h` 和 `Drivers/BSP/LCD/lcdfont.h`。`lcd_ex.c` 也要保留在 LCD 目录中，但按下一节排除其独立编译。
 
-```text
-User/stm32f1xx_hal_conf.h
-User/stm32f1xx_it.h
-Drivers/SYSTEM/**/*.h
-Drivers/BSP/**/*.h
-Drivers/BSP/LCD/lcdfont.h
-Drivers/CMSIS/**/*.h
-Drivers/STM32F1xx_HAL_Driver/Inc/**/*.h
-```
+### 2.3 排除特殊文件与重复实现
 
-### 3.2 三个必须排除的特殊文件
+对 Debug、Release 等所有使用的构建配置，核对以下文件的 **Exclude from Build** 状态：
 
-#### 1. `User/main1.c` 和 `User/main2.c`
+| 文件 | 处理方式与原因 |
+| --- | --- |
+| `User/main1.c`、`User/main2.c` | 不参与构建；它们不是当前实验入口，且引用了未纳入本实验构建的 KEY 驱动。 |
+| `Drivers/BSP/LCD/lcd_ex.c` | 保留文件但不单独编译；`lcd.c` 已通过 `#include "./BSP/LCD/lcd_ex.c"` 包含其实现。 |
+| 原 `Templates/arm/startup_stm32f103xe.s` | 不参与构建；它使用 ARMASM 语法及 ARM C 库入口，需改用 GNU 启动文件。 |
+| CubeIDE 生成的 `Core/Src/main.c` | 本文采用原 `User/main.c`，因此排除生成的入口。 |
+| 重复的 HAL、`system_stm32f1xx.c`、中断及 MSP 实现 | 每个符号保留一套实现；中断和回调的原文件位置见第4.1节。 |
 
-它们存在于磁盘中，但不在 MDK 工程构建清单内，而且还引用了本实验目录中没有纳入当前工程的 KEY 驱动。CubeIDE 若自动编译它们，会出现多个 `main()` 或缺少头文件等问题。
+## 3. 配置 CubeIDE 工程
 
-处理原则：**不加入构建，或对 Debug/Release 全部执行 Exclude from Build。**
+编译选项通常在 `Project Properties → C/C++ Build → Settings → Tool Settings` 中设置。不同版本菜单名称可能略有差异，以下配置需覆盖 Debug、Release 等实际使用的构建配置。
 
-#### 2. `Drivers/BSP/LCD/lcd_ex.c`
+### 3.1 芯片、全局宏与头文件路径
 
-`lcd.c` 中已经直接写了：
-
-```c
-#include "./BSP/LCD/lcd_ex.c"
-```
-
-这不是常规写法，但它是原工程当前的组织方式。因此 `lcd_ex.c` 的函数会在编译 `lcd.c` 时一起进入 `lcd.o`。若 CubeIDE 又单独编译 `lcd_ex.c`，链接阶段会出现大量 LCD 初始化函数重复定义。
-
-处理原则：**保留 `lcd.c` 中的包含关系时，必须把 `lcd_ex.c` 排除在独立构建之外。**
-
-较长期的重构方案是把 `lcd_ex.c` 改为正常独立编译单元，并为其提供头文件声明，但这属于驱动重构，不应与第一次 IDE 迁移同时进行。
-
-#### 3. `startup_stm32f103xe.s`
-
-原文件位于：
-
-```text
-Drivers/CMSIS/Device/ST/STM32F1xx/Source/Templates/arm/startup_stm32f103xe.s
-```
-
-文件中使用 `AREA`、`SPACE`、`PRESERVE8`、`EXPORT`、`IMPORT` 等 ARMASM 语法，并且跳转到 ARM C 库的 `__main`。GNU assembler 不能直接编译它。
-
-处理原则：**不要迁移这个 ARMASM 启动文件；使用 CubeIDE 为 STM32F103ZETx 提供的 GNU 启动文件。** 常见文件名类似 `startup_stm32f103zetx.s`，实际以目标 CubeIDE 工程生成或选用的文件为准。
-
----
-
-## 4. 源码复制还是链接：先决定工程边界
-
-将原文件放入 CubeIDE 工程有两种常见方式。
-
-### 4.1 复制到目标工程
-
-优点：
-
-- 工程自包含，换电脑和归档更容易；
-- 不会因为修改原例程而影响目标工程；
-- 路径变量较少，构建更稳定。
-
-缺点：
-
-- 后续若修复原驱动，需要手动同步；
-- 可能出现多份 HAL/BSP 副本。
-
-对于第一次完成实验13迁移，通常推荐复制，并保持 `Drivers`、`User` 的相对目录结构不变，这样原代码中的 `./SYSTEM/...`、`./BSP/...` 包含路径无需大改。
-
-### 4.2 使用 Linked Resource 链接原文件/目录
-
-优点：
-
-- 原例程与 CubeIDE 工程共用一份源代码；
-- 适合多个工程共享 BSP。
-
-缺点：
-
-- 绝对路径很容易导致工程只能在当前电脑使用；
-- 在 CubeIDE 中修改链接文件就是修改原例程；
-- 链接整个目录时，CubeIDE 可能把不应参与构建的 `.c` 文件一并发现。
-
-如果使用链接方式，应定义工作区路径变量，例如 `EXP13_ROOT`，不要把 `D:\...` 写死在工程设置中；同时逐个核对 Source Location 的 exclusion pattern 或资源的 Exclude from Build 状态。
-
-### 4.3 不要混用两套 HAL/CMSIS
-
-目标 CubeIDE 工程通常已经带有一套 CMSIS 和 HAL，原 MDK 例程也自带一套。两套同时参与编译最容易导致：
-
-- 同名类型或宏来自不同版本；
-- `stm32f1xx_hal_conf.h` 选错；
-- 同名 HAL 源文件重复链接；
-- 某个头文件来自 A 版本、实现却来自 B 版本。
-
-第一次迁移建议选择下面两种路线之一：
-
-| 路线   | 做法                                                    | 适用场景               |
-| ---- | ----------------------------------------------------- | ------------------ |
-| 保真路线 | 使用实验13自带 CMSIS、HAL、SYSTEM、BSP，只替换 GNU 启动文件和链接脚本       | 先复现实验现象，变量最少       |
-| 升级路线 | 使用目标 CubeIDE 工程的 CMSIS/HAL，仅迁移 SYSTEM、BSP、应用代码并适配 API | 明确需要升级 HAL，且愿意逐项验证 |
-
-本文后续默认采用“保真路线”。升级 HAL 应当在保真版本运行通过后单独进行。
-
----
-
-## 5. CubeIDE 中需要重建的编译契约
-
-以下内容不是创建工程步骤，而是目标工程必须满足的配置条件。不同 CubeIDE 版本菜单文字可能略有差异，通常位于：
-
-```text
-Project Properties
-└─ C/C++ Build
-   └─ Settings
-      └─ Tool Settings
-```
-
-### 5.1 MCU 和工具链
-
-应确认：
-
-- MCU/Part Number：`STM32F103ZETx`；
-- CPU：Cortex-M3；
-- 指令集：Thumb；
-- FPU：None；
-- Float ABI：无硬件 FPU 配置，不要误设为 hard；
-- 工具链：STM32CubeIDE 随附的 GNU Tools for STM32。
-
-`STM32F103ZE` 的封装和容量信息必须正确。选成同系列的中容量器件，即使部分代码能编译，也可能使用错误的启动文件、链接容量或中断向量定义。
-
-### 5.2 全局预处理宏
+确认 MCU 为 `STM32F103ZETx`，CPU 为 Cortex-M3，指令集为 Thumb，FPU 为 None，使用 CubeIDE 随附的 GNU Tools for STM32；不要启用 hard 浮点 ABI。
 
 在 MCU GCC Compiler 的 Preprocessor 中加入：
 
@@ -268,16 +107,9 @@ USE_HAL_DRIVER
 STM32F103xE
 ```
 
-两个宏作用不同：
+前者启用 HAL 入口，后者选择正确的设备寄存器和中断定义。直接设置工程宏，不修改 `stm32f1xx.h`。
 
-- `STM32F103xE` 决定 `stm32f1xx.h` 最终包含 `stm32f103xe.h`，从而得到正确的寄存器和中断定义；
-- `USE_HAL_DRIVER` 决定设备头文件继续包含 HAL 入口头文件。
-
-不要直接修改 `stm32f1xx.h` 去“永久打开”芯片宏。宏属于构建配置，应当在 Debug、Release 等所有需要的 Configuration 中明确设置。
-
-### 5.3 头文件搜索路径
-
-原 MDK 工程配置了：
+在 C Compiler 的 Include paths 中加入以下路径，按目标工程实际位置填写相对路径或项目变量：
 
 ```text
 Drivers/CMSIS/Device/ST/STM32F1xx/Include
@@ -288,70 +120,32 @@ User
 Middlewares
 ```
 
-实验13必须保留 `Drivers` 这一层搜索路径，因为源码使用了：
+`Drivers` 根路径必须保留，因为源码使用 `#include "./SYSTEM/sys/sys.h"`、`#include "./BSP/LCD/lcd.h"`。避免写死个人电脑路径。若 GNU 启动文件还包含设备头文件，再为 Assembler 添加相应 CMSIS 路径。
 
-```c
-#include "./SYSTEM/sys/sys.h"
-#include "./BSP/LCD/lcd.h"
+### 3.2 HAL 配置与时钟常量
+
+确认实际被包含的是原 `User/stm32f1xx_hal_conf.h`，其中与本实验相关的配置包括：
+
+```text
+HAL_RCC_MODULE_ENABLED
+HAL_FLASH_MODULE_ENABLED
+HAL_GPIO_MODULE_ENABLED
+HAL_CORTEX_MODULE_ENABLED
+HAL_DMA_MODULE_ENABLED
+HAL_UART_MODULE_ENABLED
+HAL_USART_MODULE_ENABLED
+HAL_SRAM_MODULE_ENABLED
 ```
 
-编译器需要从 `Drivers` 根目录开始解析 `SYSTEM` 和 `BSP`。
+启用模块宏不会自动把实现文件加入构建；对应源文件仍按第2.2节添加。原配置还启用了其他模块，无需因此把所有 HAL 源文件加入构建。
 
-建议通过 Workspace/Project 浏览按钮添加路径，让 IDE 使用 `${workspace_loc:...}`、`${ProjDirPath}` 或相对路径，不要硬编码当前电脑的绝对路径。
+确认 `HSE_VALUE` 为 `8000000U`，与板载晶振一致，否则时钟和串口波特率的计算可能错误。
 
-至少要为 C Compiler 配置上述路径。GNU 启动文件若只使用自身符号，Assembler 不一定需要全部 C 头文件路径；若启动文件包含设备头文件，则应将相关 CMSIS 路径同时加到 Assembler。
+### 3.3 GNU 启动文件与链接脚本
 
-### 5.4 语言标准、警告和优化
+只保留目标 STM32F103ZETx 对应的 GNU 启动文件，常见名称为 `startup_stm32f103zetx.s`，以目标工程实际文件为准。其向量表应匹配芯片，复位流程应调用 `SystemInit()`、完成 `.data` 复制、`.bss` 清零和 C/C++ 运行库初始化，再进入 `main()`。
 
-原工程启用了 C99，CubeIDE 可以使用 `gnu99`、`gnu11` 或项目默认的 GNU C 方言。实验13本身不依赖特别新的语法，重点是不要启用与源码不兼容的严格模式。
-
-建议分阶段使用优化：
-
-- 初次运行和单步调试：`-Og` 或 `-O0`；
-- 与 MDK Level 1 做行为/尺寸对比：`-O1`；
-- Release：验证通过后再选择更高优化。
-
-初次迁移不建议直接开启“所有警告均视为错误”。先看清警告来源，再修正未使用参数、格式化参数类型和编译器专用代码。不要用全局关闭警告掩盖真实问题。
-
-原 MDK 工程还启用了短枚举相关选项。实验13没有预编译第三方库，也没有明显依赖枚举尺寸的接口，因此通常不必机械地加 `-fshort-enums`。只有当 ABI、通信结构体、二进制文件格式或预编译库明确依赖枚举宽度时才需要保持一致。
-
-### 5.5 源文件编码
-
-实验13的主要 `.c`、`.h` 和 `readme.txt` 不是 UTF-8，实际是 GBK/本地 ANSI 风格。CubeIDE 若按 UTF-8 打开，会出现中文注释乱码；在乱码状态下保存，还可能不可逆地破坏原文件。
-
-可选做法：
-
-1. 在工程或文件属性中把 Text file encoding 设置为 GBK；
-2. 先备份，再一次性把源码转换为 UTF-8，并在团队中统一编码。
-
-编码只影响注释时通常不阻止编译，但字符串常量中存在中文时还会改变固件字节内容，因此不能只把它当显示问题。
-
----
-
-## 6. 启动文件和链接脚本：不能“看起来差不多”
-
-### 6.1 启动文件必须属于 GNU 工具链和准确芯片
-
-CubeIDE 工程中应只有一个有效启动文件，且应满足：
-
-- 为 STM32F103ZETx/高密度 F103 器件提供正确的中断向量表；
-- 使用 GNU assembler 语法；
-- 定义 `Reset_Handler`；
-- 调用 `SystemInit()`；
-- 完成 `.data` 复制、`.bss` 清零和 C/C++ 运行库初始化；
-- 最终调用 `main()`。
-
-必须排除原 MDK 的 ARMASM 启动文件，也不能同时保留两个 GNU 启动文件。
-
-典型错误现象：
-
-- 编译时报 `AREA`、`PRESERVE8`、`EXPORT` 等“未知指令”；
-- 链接时报多个 `Reset_Handler` 或 `.isr_vector`；
-- 下载后停在复位或 HardFault，进不了 `main()`。
-
-### 6.2 链接脚本的内存区域
-
-STM32F103ZE 的基本内存定义应等价于：
+链接脚本的内存定义应等价于：
 
 ```ld
 MEMORY
@@ -361,51 +155,28 @@ MEMORY
 }
 ```
 
-同时检查：
+检查 `.isr_vector` 位于 Flash 起始处并使用 `KEEP()`；`.text/.rodata` 位于 Flash，`.data` 在 Flash 中保存初值、运行于 RAM，`.bss` 位于 RAM。
 
-- 向量表所在的 `.isr_vector` 被放在 Flash 起始位置并使用 `KEEP()`；
-- `.text`、`.rodata` 位于 Flash；
-- `.data` 的加载地址在 Flash、运行地址在 RAM；
-- `.bss` 位于 RAM；
-- 栈和堆预留没有超过 64 KiB RAM。
+原 MDK 启动文件预留栈 `0x400` 字节、堆 `0x200` 字节，可对照 `_Min_Stack_Size`、`_Min_Heap_Size` 检查，实际大小按调用深度和内存使用调整，RAM 总量不能超过 64 KiB。本实验无 Bootloader，向量表不额外偏移。
 
-原 MDK 启动文件中栈为 `0x400` 字节、堆为 `0x200` 字节。如果需要尽量等价，可检查 CubeIDE 链接脚本中的 `_Min_Stack_Size`、`_Min_Heap_Size`；是否需要增加则取决于实际调用深度和动态内存使用，而不是只照抄数值。
+LCD 的 FSMC 地址属于外设总线窗口，**不要将其添加为链接脚本的普通 RAM 段**。地址与总线配置见第5.2节。
 
-实验13没有 Bootloader，标准链接地址是 `0x08000000`，向量表也不应额外偏移。如果未来放到 Bootloader 之后，Flash ORIGIN、可用 LENGTH、下载地址和 `SCB->VTOR` 必须成套修改。
+### 3.4 编译、编码与输出
 
-### 6.3 FSMC 的 `0x6C000000` 不需要写入链接脚本
+| 项目 | 设置 |
+| --- | --- |
+| C 标准 | 原工程使用 C99，可选 `gnu99`、`gnu11` 或兼容的 GNU C 方言。 |
+| 优化 | 初次调试用 `-Og` 或 `-O0`；通过后再验证 `-O1` 或 Release 配置。 |
+| 警告 | 初次迁移先逐项处理警告，不必立即全部视为错误，也不要全局关闭警告。 |
+| 编码 | 原主要源码为 GBK/本地 ANSI 风格。设置为 GBK，或备份后统一转换为 UTF-8；不要在乱码状态下保存。中文字符串的字节内容也受编码影响。 |
+| HEX（按需） | 在 MCU Post build outputs 中启用 Convert to Intel Hex；等价命令为 `arm-none-eabi-objcopy -O ihex`。 |
+| ELF/MAP | 保留 ELF 用于带符号调试；查看 MAP，确认实际链接的实现及 Flash/RAM 占用。使用 `--gc-sections` 时仍需保留向量表的 `KEEP()`。 |
 
-LCD 通过内存映射 I/O 访问 FSMC Bank1 NE4。`lcd.h` 根据 NE4 和 A10 计算：
+## 4. 调整入口与编译器相关代码
 
-```text
-LCD_REG = 0x6C0007FE
-LCD_RAM = 0x6C000800
-```
+### 4.1 保留唯一的入口和初始化路径
 
-这些地址是外设总线窗口，不是用来放置 `.data`、`.bss` 或堆的普通 RAM，因此不需要为 LCD 在链接脚本中增加一个 MEMORY 段。真正需要保证的是：
-
-- 芯片确实具有 FSMC；
-- FSMC 和相关 GPIO 时钟已打开；
-- NE4、A10、NWE、NOE、D0~D15 的引脚连接正确；
-- 访问之前已经完成 `HAL_SRAM_Init()`。
-
----
-
-## 7. `main()`、时钟和 CubeMX 代码所有权
-
-CubeIDE 目标工程可能包含 `.ioc`，并生成 `Core/Src/main.c`、`SystemClock_Config()`、`MX_GPIO_Init()` 等代码。原实验也有自己的 `main()` 和初始化函数。两套初始化不能不加判断地叠加。
-
-### 7.1 首次保真迁移的推荐做法
-
-为了尽量保持实验13行为：
-
-- 只保留原 `User/main.c` 作为唯一 `main()`；
-- 保留原 `sys_stm32_clock_init(RCC_PLL_MUL9)`；
-- 保留 `usart_init()`、`led_init()`、`lcd_init()`；
-- 不再调用 CubeMX 生成的 `SystemClock_Config()`、`MX_USART1_UART_Init()`、`MX_FSMC_Init()`；
-- 确保 Cube 生成的另一个 `main.c` 不参与构建。
-
-原初始化顺序是：
+本文保留原 `User/main.c`，初始化顺序如下：
 
 ```c
 HAL_Init();
@@ -416,75 +187,28 @@ led_init();
 lcd_init();
 ```
 
-这个顺序有依赖关系：延时系数依赖 72 MHz，LCD 初始化过程依赖延时，串口波特率也依赖正确的外设时钟。
+延时系数依赖主频，LCD 初始化依赖延时，串口波特率依赖外设时钟。不要再叠加调用生成的 `SystemClock_Config()`、`MX_USART1_UART_Init()`、`MX_FSMC_Init()`；生成的 GPIO 初始化也不能在之后覆盖驱动设置。
 
-### 7.2 需要继续用 `.ioc` 生成代码时
+按符号检查重复实现，原代码中的归属为：
 
-若项目将长期由 CubeMX/CubeIDE 维护，不建议让生成器管理的 `main.c` 被整文件替换。可在保真版本验证成功后再做第二阶段整理：
+| 符号 | 原实现位置 |
+| --- | --- |
+| `main()` | `User/main.c` |
+| `SystemInit()`、`SystemCoreClock` | `system_stm32f1xx.c` |
+| `SysTick_Handler()` | `User/stm32f1xx_it.c` |
+| `USART1_IRQHandler()`、`HAL_UART_MspInit()` | `Drivers/SYSTEM/usart/usart.c` |
+| `HAL_SRAM_MspInit()` | `Drivers/BSP/LCD/lcd.c` |
+| `HAL_Delay()` | `Drivers/SYSTEM/delay/delay.c`，覆盖 HAL 弱实现 |
 
-- 保留生成的 `main.c`；
-- 把实验主循环迁入 `app.c/app.h`，例如 `app_init()`、`app_process()`；
-- 只在 `USER CODE BEGIN/END` 区域调用应用接口；
-- 时钟、USART、FSMC 到底由 CubeMX 生成代码初始化，还是由原 BSP 初始化，必须逐个外设确定唯一所有者；
-- 若改用 `MX_FSMC_Init()`，必须逐字段对照原 `lcd_init()` 的 Bank、总线宽度、扩展模式和读写时序，不能只做到“启用 FSMC”。
+如果生成的 `stm32f1xx_hal_msp.c`、`stm32f1xx_it.c` 也包含同名强实现，应排除重复实现或合并所需逻辑。继续使用 `.ioc` 生成代码前，按附录 B 整理代码边界，避免重新引入重复入口或初始化。
 
-最重要的规则是：**同一硬件资源只保留一套初始化路径。**
+`sys.c` 中的 `__ASM volatile(...)`、`__set_MSP()` 已由 CMSIS 按编译器适配，使用正确 CMSIS 时通常可以保留。
 
-### 7.3 避免重复的系统文件和回调
+### 4.2 适配 GCC 的 `printf` 输出
 
-以下符号在 CubeIDE 自动生成代码和原实验中都可能存在：
+修改 `Drivers/SYSTEM/usart/usart.c` 的重定向部分。原 `fputc()` 和半主机处理面向 ARMCC；GCC/newlib 通常通过 `_write()` 输出，CubeIDE 的 `syscalls.c` 可能进一步调用 `__io_putchar()`。按实际调用链选择以下一种接法。
 
-```text
-main
-SystemInit
-SystemCoreClock
-SysTick_Handler
-USART1_IRQHandler
-HAL_UART_MspInit
-HAL_SRAM_MspInit
-HAL_Delay
-```
-
-迁移时应按“符号”检查，而不是只按文件名检查。例如原实验的：
-
-- `USART1_IRQHandler()` 和 `HAL_UART_MspInit()` 位于 `usart.c`；
-- `HAL_SRAM_MspInit()` 位于 `lcd.c`；
-- `HAL_Delay()` 位于 `delay.c`，会覆盖 HAL 中的弱实现；
-- `SysTick_Handler()` 位于 `stm32f1xx_it.c`。
-
-如果 Cube 生成的 `stm32f1xx_hal_msp.c`、`stm32f1xx_it.c` 也定义同名强符号，就必须选择一套实现或合并逻辑。
-
----
-
-## 8. ARMCC 到 GCC 的代码差异
-
-### 8.1 CMSIS 汇编封装通常可以直接保留
-
-`sys.c` 使用：
-
-```c
-__ASM volatile("wfi");
-__ASM volatile("cpsid i");
-__ASM volatile("cpsie i");
-__set_MSP(addr);
-```
-
-这里的 `__ASM` 和 `__set_MSP()` 由 CMSIS 根据编译器适配。只要使用正确的 CMSIS 头文件，GCC 下通常无需改写。不要因为看见汇编就立刻替换；先区分“CMSIS 已封装的内联汇编”和“ARMASM 独立启动文件”。
-
-### 8.2 实验13的 `printf` 重定向必须处理
-
-原 `usart.c` 的重定向逻辑专门面向 ARMCC：
-
-- AC5 使用 `#pragma import(__use_no_semihosting)`；
-- AC6 使用 `__use_no_semihosting`、`__ARM_use_no_argv`；
-- 定义 `_ttywrch()`、`_sys_exit()`、`_sys_command_string()`；
-- 通过重写 `fputc()` 把字符写入 USART。
-
-在 GCC 中，未定义的 `__ARMCC_VERSION` 在 `#if` 表达式中会按 0 处理，因此代码会落入 AC5 分支。GCC 可能只警告并忽略 `#pragma import`，但这并不等于重定向正确。GNU/newlib 的 `printf` 通常最终需要 `_write()` 系统调用，或者由 CubeIDE 的 `syscalls.c` 间接调用 `__io_putchar()`。
-
-#### 方案 A：目标工程已有 `syscalls.c`
-
-先查看其中的 `_write()` 是否调用 `__io_putchar()`。如果是，只需提供唯一的强实现：
+**方案 A：已有 `syscalls.c`，且其中 `_write()` 调用 `__io_putchar()`。** 保留该 `_write()`，在串口源文件中提供唯一的强实现：
 
 ```c
 #if defined(__GNUC__)
@@ -500,9 +224,7 @@ int __io_putchar(int ch)
 #endif
 ```
 
-#### 方案 B：没有可用的 `syscalls.c`
-
-提供 `_write()`：
+**方案 B：没有可用的 `syscalls.c` 输出路径。** 在串口源文件中实现 `_write()`，并确认构建中没有另一套强实现：
 
 ```c
 #if defined(__GNUC__)
@@ -525,7 +247,7 @@ int _write(int file, char *ptr, int len)
 #endif
 ```
 
-然后把 MDK 专用半主机代码放进明确的编译器条件中，例如：
+这些代码使用原串口模块中的 `USART_UX` 定义。将原 ARMCC 重定向代码和选定的 GCC 实现放在明确的条件分支中：
 
 ```c
 #if defined(__CC_ARM) || defined(__ARMCC_VERSION)
@@ -537,66 +259,15 @@ int _write(int file, char *ptr, int len)
 #endif
 ```
 
-注意事项：
+原 `#if __ARMCC_VERSION ...` 在 GCC 中可能因宏未定义而落入 AC5 分支；应隔离整段 ARMCC 专用代码，包括 `#pragma import(__use_no_semihosting)`、`__ARM_use_no_argv`、`_ttywrch()`、`_sys_exit()`、`_sys_command_string()` 等。
 
-- `_write()`、`__io_putchar()` 不要同时存在多套强实现；
-- 若链接参数使用了 `--specs=nosys.specs`，仍可由用户实现覆盖需要的系统调用；
-- 实验13只使用 `%x/%X` 和字符串，不需要为 `printf` 开启浮点格式化；
-- 若在中断中打印或多任务环境中打印，还要考虑阻塞和重入，本实验主流程暂不涉及；
-- USART 初始化之前不要调用这套串口输出。
+每个输出函数只保留一套强实现；使用 `--specs=nosys.specs` 时仍可提供自己的系统调用。先完成 USART 初始化再打印。本实验使用整数和字符串，不需要开启 `printf` 浮点格式化。
 
-### 8.3 格式化参数类型
+### 4.3 完整初始化 FSMC 时序结构体
 
-原 `main.c` 中有：
+修改 `Drivers/BSP/LCD/lcd.c` 中的 `lcd_init()`。原时序结构体未给 `BusTurnAroundDuration`、`CLKDivision`、`DataLatency` 赋值，而 HAL/LL 会读取这些成员；编译器或优化级别变化后可能暴露未初始化问题。
 
-```c
-sprintf((char *)lcd_id, "LCD ID:%04X", lcddev.id);
-```
-
-缓冲区 12 字节刚好能容纳 11 个可见字符和结尾 `\0`，但迁移时更建议显式限制长度并匹配参数类型：
-
-```c
-snprintf((char *)lcd_id,
-         sizeof(lcd_id),
-         "LCD ID:%04X",
-         (unsigned int)lcddev.id);
-```
-
-这样可以消除较严格 GCC 格式检查下的类型警告，也避免后续格式变化造成越界。
-
----
-
-## 9. 实验13最值得注意的可移植性隐患：FSMC 时序结构体
-
-`lcd_init()` 当前声明了：
-
-```c
-FSMC_NORSRAM_TimingTypeDef fsmc_read_handle;
-FSMC_NORSRAM_TimingTypeDef fsmc_write_handle;
-```
-
-随后只设置了：
-
-```text
-AddressSetupTime
-AddressHoldTime
-DataSetupTime
-AccessMode
-```
-
-但是该 HAL 版本的 `FSMC_NORSRAM_TimingTypeDef` 还包含：
-
-```text
-BusTurnAroundDuration
-CLKDivision
-DataLatency
-```
-
-HAL/LL 初始化代码会读取这些成员并写入寄存器。它们若未初始化，就取决于当前栈内容；编译器、优化级别或前序函数稍有变化，结果就可能不同。这类问题经常被误判成“Keil 能跑，CubeIDE 不能跑”。
-
-另外，原代码将 `AddressHoldTime` 设为 0，而本 HAL 的参数约束要求 1~15。当前 `USE_FULL_ASSERT` 未启用，因此不会立即报告；一旦开启完整断言，初始化可能停在断言中。
-
-建议在进行运行结果对比前先把结构体完整、确定地初始化。例如：
+将两个时序结构体的声明和赋值整理为：
 
 ```c
 FSMC_NORSRAM_TimingTypeDef fsmc_read_handle = {0};
@@ -619,34 +290,34 @@ fsmc_write_handle.DataLatency           = 2;
 fsmc_write_handle.AccessMode            = FSMC_ACCESS_MODE_A;
 ```
 
-说明：异步 SRAM/LCD 模式下，`CLKDivision` 和 `DataLatency` 不参与实际异步访问时序，但仍应赋予 HAL 接受的确定值；`AddressHoldTime` 在当前访问模式下通常不起关键作用，但也应满足参数约束。
+原 `AddressHoldTime=0` 不符合该 HAL 的 1～15 参数约束，示例改为 1，避免启用 `USE_FULL_ASSERT` 后停在断言中。异步模式下 `CLKDivision`、`DataLatency` 不参与实际异步时序，仍应赋予 HAL 接受的确定值。
 
-第一次验证建议先保留原实验的关键读写时序：
+首次验证保留上面的读写时序，并启用 Extended Mode。若接线、主频正确后仍有不稳定，再逐项调整 `DataSetupTime`，不要同时改变 Bank、总线宽度和地址线。
 
-- 读：`AddressSetupTime = 0`，`DataSetupTime = 15`；
-- 写：`AddressSetupTime = 0`，`DataSetupTime = 1`；
-- 异步模式 A；
-- 读写使用不同的时序（Extended Mode Enable）。
+### 4.4 建议限制格式化输出长度
 
-如果读取 ID 不稳定、屏幕偶发花屏或某些屏型不能初始化，可在确认接线和主频正确后适当增大 `DataSetupTime`，尤其是写时序。调时序应一次只改一个参数并记录结果，不要同时修改总线宽度、Bank 和地址线。
+原 `User/main.c` 使用 `sprintf()` 生成 LCD ID 字符串，12 字节缓冲区刚好容纳当前内容。可改成下面的写法，明确参数类型并限制写入长度：
 
----
+```c
+snprintf((char *)lcd_id,
+         sizeof(lcd_id),
+         "LCD ID:%04X",
+         (unsigned int)lcddev.id);
+```
 
-## 10. 实验13的硬件映射必须保持一致
+## 5. 接线、下载与运行验证
 
-### 10.1 基础外设
+### 5.1 核对硬件接线
 
-| 功能        | 引脚/参数              |
-| --------- | ------------------ |
-| LED0      | PB5                |
-| LED1      | PE5（本主程序主要使用 LED0） |
-| USART1 TX | PA9                |
-| USART1 RX | PA10               |
-| 串口波特率     | 115200             |
-| HSE       | 8 MHz              |
-| SYSCLK    | 72 MHz             |
+基础外设：
 
-### 10.2 LCD 控制信号
+| 功能 | 引脚/参数 |
+| --- | --- |
+| LED0 / LED1 | PB5 / PE5，主程序主要使用 LED0 |
+| USART1 TX / RX | PA9 / PA10，确认与板载 USB 转串口跳线连接 |
+| 串口参数 | 115200 bit/s，8N1 |
+
+LCD 控制信号：
 
 | LCD 信号 | FSMC/MCU 引脚 |
 | ------ | ----------- |
@@ -656,7 +327,7 @@ fsmc_write_handle.AccessMode            = FSMC_ACCESS_MODE_A;
 | RD     | NOE / PD4   |
 | BL     | PB0         |
 
-### 10.3 LCD 16 位数据总线
+LCD 16 位数据总线：
 
 | LCD 数据 | MCU 引脚 | LCD 数据 | MCU 引脚 |
 | ------ | ------ | ------ | ------ |
@@ -669,7 +340,9 @@ fsmc_write_handle.AccessMode            = FSMC_ACCESS_MODE_A;
 | D6     | PE9    | D14    | PD9    |
 | D7     | PE10   | D15    | PD10   |
 
-对应的 FSMC 参数必须是：
+### 5.2 核对 FSMC 配置与地址
+
+原驱动负责 FSMC 初始化，其配置应保持为：
 
 ```text
 Bank                 = FSMC_NORSRAM_BANK4
@@ -682,203 +355,82 @@ Burst/WriteBurst     = Disable
 AccessMode           = Mode A
 ```
 
-屏幕是内存映射设备，代码能正常编译并不说明引脚和总线配置正确。尤其要避免让 `.ioc` 生成的 GPIO 初始化在 `lcd_init()` 之后又把 FSMC 引脚改回普通 GPIO。
-
----
-
-## 11. HAL 配置与实现文件要成对出现
-
-实验13使用原 `User/stm32f1xx_hal_conf.h`。其中启用了许多 HAL 模块，但原 MDK 工程并没有把所有模块的 `.c` 实现都加入构建。这本身不一定有问题：头文件被包含不等于对应函数一定会被链接。
-
-与当前实验直接相关的关键模块包括：
+读写时序见第4.3节。NE4 和 A10 对应原 `lcd.h` 中的访问地址：
 
 ```text
-HAL_RCC_MODULE_ENABLED
-HAL_FLASH_MODULE_ENABLED
-HAL_GPIO_MODULE_ENABLED
-HAL_CORTEX_MODULE_ENABLED
-HAL_DMA_MODULE_ENABLED
-HAL_UART_MODULE_ENABLED
-HAL_USART_MODULE_ENABLED
-HAL_SRAM_MODULE_ENABLED
+LCD_REG = 0x6C0007FE
+LCD_RAM = 0x6C000800
 ```
 
-如果改用 CubeIDE 工程自己的 `stm32f1xx_hal_conf.h`，必须至少确保实际调用到的模块已开启。典型对应关系为：
+访问前必须开启 FSMC 和相关 GPIO 时钟并完成 `HAL_SRAM_Init()`。避免后续 GPIO 初始化把 FSMC 引脚改回普通 GPIO。
 
-| 报错/缺失符号                 | 优先检查                                             |
-| ----------------------- | ------------------------------------------------ |
-| `SRAM_HandleTypeDef` 未知 | `HAL_SRAM_MODULE_ENABLED`、`stm32f1xx_hal_sram.h` |
-| `HAL_SRAM_Init` 未定义     | `stm32f1xx_hal_sram.c`                           |
-| `FSMC_NORSRAM_Init` 未定义 | `stm32f1xx_ll_fsmc.c`                            |
-| `HAL_UART_Init` 未定义     | `stm32f1xx_hal_uart.c`                           |
-| GPIO/RCC HAL 符号未定义      | 对应 HAL 模块宏和 `.c` 文件                              |
+### 5.3 按阶段验证
 
-还要确认 `HSE_VALUE` 为 `8000000U`。如果头文件来自另一套 HAL 且 HSE 数值不同，`SystemCoreClock` 和波特率计算可能错误，即使 PLL 配置代码表面上仍是 ×9。
+先完成编译和链接，再用 ELF 下载调试。使用 ST-LINK/SWD 时确认下载地址从 `0x08000000` 开始；可在 `Reset_Handler`、`main`、`sys_stm32_clock_init`、`HAL_SRAM_Init` 和 `HardFault_Handler` 设置断点。
 
----
+1. **启动与时钟**：确认能进入 `main()`，且不会反复复位或进入 HardFault。时钟初始化后检查 `SystemCoreClock=72 MHz`，RCC 的 SYSCLK 来源为 PLL，AHB=72 MHz、APB1=36 MHz、APB2=72 MHz。IDE 中的 CPU Frequency 设置不能代替 RCC 初始化。
+2. **LED 与延时**：先验证 LED0 翻转和 `delay_ms(1000)` 的量级，确认 SysTick 运行正常。周期不对时先查时钟和 `delay_init(72)`。
+3. **串口**：在 `lcd_init()` 前临时打印固定 ASCII 文本，确认 GCC 输出路径生效；若使用串口中断，检查 `USART1_IRQHandler()` 调用 `HAL_UART_IRQHandler()`。
+4. **FSMC 访问**：进入 `lcd_init()` 后检查 FSMC、GPIOD、GPIOE、GPIOG、GPIOB 时钟，确认 `HAL_SRAM_Init()` 返回 `HAL_OK`，LCD 地址访问不触发 BusFault；需要时观察 NE4、A10、NWE、NOE 波形。
+5. **LCD 显示**：确认 ID 稳定且被当前驱动支持，例如 `0x9341`、`0x7789`、`0x5310`、`0x7796`、`0x5510`、`0x9806`、`0x1963`，随后恢复完整主循环。异常现象按第6章排查。
 
-## 12. 推荐的分阶段移植和验证方法
+### 5.4 最终验收
 
-### 阶段 0：冻结 MDK 基线
+- [ ] LCD 按顺序循环显示 12 种背景色，固定字符串位置和颜色正确。
+- [ ] LCD 显示的 ID 与复位后串口输出一致。
+- [ ] LED0 约每秒翻转一次。
+- [ ] 冷启动、复位、重新下载后均能正常运行。
+- [ ] Debug 和 Release 均已编译并完成运行验证。
 
-在改动前记录：
+以上是待执行的验收项目，编译通过不能代替上板验证。
 
-- MDK 是否能无错误编译；
-- 现有 `Output/atk_f103.hex` 是否能正常运行；
-- LCD 型号和读取到的 ID；
-- LED 周期和串口输出；
-- 使用的板卡、屏、电源、跳线和下载器。
+## 6. 常见问题速查
 
-若原始 HEX 都不能在当前硬件上运行，就不能把后续问题简单归因于移植。
+从最早失败的阶段开始排查：先解决编译和链接，再确认时钟，最后排查外设。
 
-### 阶段 1：只验证启动、链接和时钟
+| 现象 | 优先检查 |
+| --- | --- |
+| 找不到 `stm32f1xx.h` | CMSIS Device Include 路径。 |
+| 找不到 `./BSP/LCD/lcd.h` | 是否加入 `Drivers` 根路径。 |
+| 提示未选择 STM32F1 器件 | `STM32F103xE` 宏及其生效的构建配置。 |
+| `SRAM_HandleTypeDef` 未知 | `HAL_SRAM_MODULE_ENABLED`、`stm32f1xx_hal_sram.h` 及配置头文件来源。 |
+| 汇编器不认识 `AREA`、`EXPORT` | 错将 ARMASM 启动文件交给 GNU assembler。 |
+| 多个 `main` / LCD 初始化函数 | 生成的 `main.c`、`main1.c/main2.c` 是否排除；`lcd_ex.c` 是否被重复编译。 |
+| 多个 `SystemInit`、`SystemCoreClock`、`Reset_Handler` | 重复的系统源文件或启动文件；结合 MAP 确认实际来源。 |
+| 多个中断或 MSP 函数 | 原驱动与 CubeMX 生成代码同时提供强实现，按第4.1节处理。 |
+| `HAL_SRAM_Init` / `FSMC_NORSRAM_Init` 未定义 | 缺少 `stm32f1xx_hal_sram.c` / `stm32f1xx_ll_fsmc.c`。 |
+| `HAL_UART_Init` 或 GPIO/RCC HAL 符号未定义 | 对应模块宏和 `.c` 文件是否同时具备。 |
+| 进不了 `main`，停在复位或 HardFault | 启动文件、链接布局和向量表；早期调试连接失败时尝试 Connect under reset。 |
+| `printf` 无输出 | `_write()` / `__io_putchar()` 调用链、串口初始化、是否误用半主机。 |
+| 串口乱码或延时不对 | `HSE_VALUE`、PLL、PCLK2、波特率、`delay_init(72)` 和 SysTick 实现。 |
+| 停在 FSMC 参数断言 | `AddressHoldTime` 等字段是否合法，两个时序结构体是否完整初始化。 |
+| 首次访问 LCD 即 HardFault | FSMC 使能、芯片和启动配置；读取 `SCB->CFSR`、`SCB->HFSR`、`SCB->BFAR` 定位故障。 |
+| LCD ID 总是 `0x0000` | 屏供电、数据线被拉低、读控制或片选未工作。 |
+| LCD ID 总是 `0xFFFF` | 屏未连接、总线悬空、片选或 RD 未工作。 |
+| LCD ID 每次不同 | 读时序、电源、接触不稳或数据线冲突。 |
+| ID 正确但白屏 / 花屏 | 背光、屏型及初始化序列、写时序、数据位映射和供电。 |
+| Debug 正常、Release 异常 | 未初始化变量、越界、`volatile` 和依赖优化的时序。 |
+| 中文注释乱码 | 原文件 GBK/ANSI 与 IDE 编码设置不一致。 |
 
-目标：能够进入唯一的 `main()`，`SystemInit()` 被调用，程序不在复位和 HardFault 中循环。
+4.3/7 寸等较大屏幕还需留意供电能力；供电不足可能造成复位、白屏或初始化失败。
 
-检查点：
+## 附录 A：链接原文件或升级 HAL
 
-- `Reset_Handler` 能命中；
-- `main()` 能命中；
-- `SystemCoreClock` 在时钟初始化后为 72 MHz；
-- RCC 的 SYSCLK 来源为 PLL，AHB=72 MHz、APB1=36 MHz、APB2=72 MHz。
+需要多个工程共用源码时，可使用 Linked Resource。定义 `EXP13_ROOT` 等路径变量，避免绝对路径；修改链接文件会同时修改原例程。链接整个目录后，仍需按第2章核对 Source Location 的 exclusion pattern 或 Exclude from Build。
 
-注意：IDE 中填写的 CPU Frequency 主要影响调试显示或工具设置，不能代替程序实际配置 RCC。
+若必须使用目标工程的新 CMSIS/HAL，则只迁入 SYSTEM、BSP 和应用代码，并逐项适配 API、配置头文件与初始化参数。升级 HAL 建议在原库版本运行通过后单独进行，仍保持库来源唯一。
 
-### 阶段 2：验证 LED 和延时
+## 附录 B：移植成功后继续使用 CubeMX
 
-暂时不要把“LCD 不亮”作为第一个运行判断。先验证：
+需要长期由 `.ioc` 维护工程时，再按以下方式整理：
 
-- LED0 引脚能被正确配置；
-- `delay_ms(1000)` 的量级正确；
-- SysTick 在运行且没有两个 `SysTick_Handler()`。
+1. 保留生成的 `main.c`，将实验逻辑迁到 `app.c/app.h`，例如 `app_init()`、`app_process()`；排除旧入口。
+2. 只在 `USER CODE BEGIN/END` 区域调用应用接口。
+3. 为时钟、USART、FSMC 逐项确定唯一初始化来源；若改用 `MX_FSMC_Init()`，逐字段核对 Bank、总线宽度、扩展模式及读写时序。
+4. 将 `lcd_ex.c` 改成独立编译单元时，同时移除对它的直接包含，并补齐头文件声明；板级引脚集中定义。
+5. 保持 HAL/CMSIS 来源唯一，路径不依赖个人电脑，Debug/Release 配置同步。
 
-如果 LED 周期明显不对，先回头检查时钟和 `delay_init(72)`，不要调 FSMC。
-
-### 阶段 3：验证串口
-
-检查：
-
-- PA9/PA10 跳线连接到板载 USB 转串口；
-- 115200、8N1；
-- GCC 的 `_write()` 或 `__io_putchar()` 已生效；
-- 没有启用意外的 semihosting；
-- USART1 中断入口只有一个，并调用 `HAL_UART_IRQHandler()`。
-
-可以在 `lcd_init()` 之前临时打印一条固定 ASCII 文本，以区分“串口重定向问题”和“LCD 初始化卡死”。
-
-### 阶段 4：验证 FSMC 基础访问
-
-进入 `lcd_init()` 后检查：
-
-- FSMC、GPIOD、GPIOE、GPIOG、GPIOB 时钟已开启；
-- `HAL_SRAM_Init()` 返回 `HAL_OK`；
-- `0x6C0007FE` 和 `0x6C000800` 的访问没有触发 BusFault；
-- NE4、A10、NWE、NOE 上能观察到访问波形；
-- 数据总线宽度为 16 位。
-
-如果在首次 LCD 地址访问时进入 HardFault，查看：
-
-```text
-SCB->CFSR
-SCB->HFSR
-SCB->BFAR
-```
-
-这比只看 PC 停在 `HardFault_Handler()` 更有价值。
-
-### 阶段 5：验证 LCD ID 和显示
-
-实验驱动支持多种控制器，代码会依次尝试读取 ID。合理结果应是驱动已支持的 ID，例如：
-
-```text
-0x9341  0x7789  0x5310  0x7796  0x5510  0x9806  0x1963
-```
-
-常见异常含义：
-
-- 总是 `0x0000`：数据线被拉低、读控制/片选未工作或屏未供电；
-- 总是 `0xFFFF`：总线悬空、片选未选中、RD 未工作或屏未连接；
-- 每次 ID 不同：读时序过快、数据线冲突、电源或接触不稳定；
-- ID 正确但白屏：背光、写时序、初始化序列或屏型判断问题；
-- ID 正确但花屏：写时序、总线数据位映射或供电完整性问题。
-
-4.3/7 寸等较大屏幕可能需要更大电流。USB 供电不足会造成看似随机的复位、白屏或初始化失败，这不是编译器问题。
-
-### 阶段 6：恢复完整主循环并做回归
-
-最后确认：
-
-- 12 种背景色按顺序切换；
-- 固定字符串位置和颜色正确；
-- LCD ID 显示和串口打印一致；
-- LED0 约每秒翻转；
-- 连续复位、重新下载、冷启动均可运行；
-- Debug 与 Release 至少各验证一次。
-
----
-
-## 13. 编译、链接和运行错误的分层排查表
-
-| 现象                                | 所属层        | 优先检查                                      |
-| --------------------------------- | ---------- | ----------------------------------------- |
-| 找不到 `stm32f1xx.h`                 | 预处理        | CMSIS Device Include 路径                   |
-| 找不到 `./BSP/LCD/lcd.h`             | 预处理        | 是否加入 `Drivers` 根路径                        |
-| 提示未选择 STM32F1 器件                  | 预处理        | `STM32F103xE` 宏                           |
-| `SRAM_HandleTypeDef` 未知           | HAL 配置     | `HAL_SRAM_MODULE_ENABLED` 和配置头文件来源        |
-| 汇编器不认识 `AREA`/`EXPORT`            | 启动文件       | 错把 ARMASM 文件交给 GNU assembler              |
-| 多个 `main`                         | 文件集合       | 排除生成的 main 或 `main1.c/main2.c`            |
-| 多个 LCD 初始化函数                      | 文件集合       | `lcd_ex.c` 被包含后又单独编译                      |
-| 多个 `SystemInit`/`SystemCoreClock` | CMSIS      | 两份 `system_stm32f1xx.c`                   |
-| 多个中断或 MSP 函数                      | 代码所有权      | 原 BSP 与 CubeMX 生成代码同时实现                   |
-| `HAL_SRAM_Init` 未定义               | 链接         | 缺少 `stm32f1xx_hal_sram.c`                 |
-| `FSMC_NORSRAM_Init` 未定义           | 链接         | 缺少 `stm32f1xx_ll_fsmc.c`                  |
-| `printf` 无输出                      | C 运行库      | `_write`/`__io_putchar`、串口初始化、半主机配置       |
-| 程序停在断言                            | 参数检查       | FSMC `AddressHoldTime` 等参数不合法             |
-| 能进 `main`，延时不对                    | 时钟/SysTick | HSE_VALUE、PLL、`delay_init(72)`、重复 SysTick |
-| 串口乱码                              | 时钟/UART    | HSE、PCLK2、波特率、串口参数                        |
-| 首次访问 LCD 即 HardFault              | 总线         | FSMC 未启用、芯片/启动配置错误、查看 BFAR/CFSR           |
-| LCD ID 为 0 或 FFFF                 | 硬件/时序      | 供电、排线、CS/RD、数据线、读时序                       |
-| Debug 正常、Release 异常               | 可移植性       | 未初始化变量、越界、`volatile`、优化相关时序               |
-| 中文注释乱码                            | 编码         | 原文件为 GBK/ANSI，IDE 被设为 UTF-8               |
-
-排错时始终从最早失败的一层开始。预处理错误没有解决时，不要研究链接脚本；时钟还没确认时，不要开始调 LCD 初始化寄存器。
-
----
-
-## 14. 构建产物和调试设置
-
-### 14.1 HEX 输出
-
-原 MDK 工程生成 `Output/atk_f103.hex`。CubeIDE 中可在 MCU Post build outputs 中启用 Convert to Intel Hex，或使用等价的 `arm-none-eabi-objcopy -O ihex` 后处理。
-
-HEX 只是 ELF 的一种烧录表示。日常调试仍应保留 ELF，因为符号、源代码行和调试信息都在 ELF 中。
-
-### 14.2 MAP 文件和尺寸检查
-
-建议启用或查看链接 MAP，并确认：
-
-- 只有一个 `main`、`SystemInit`、`Reset_Handler`；
-- `lcd_ex_*` 函数只来自 `lcd.o`；
-- Flash/RAM 使用量没有越界；
-- 中断入口来自预期文件；
-- 没有意外链接另一套 HAL。
-
-启用 `--gc-sections` 通常没有问题，但链接脚本必须对中断向量表使用 `KEEP()`，否则未被普通函数引用的关键段可能被删除。
-
-### 14.3 调试器
-
-使用 ST-LINK/SWD 时，初次移植建议：
-
-- 在 `Reset_Handler`、`main`、`sys_stm32_clock_init`、`HAL_SRAM_Init`、`HardFault_Handler` 设置断点；
-- 早期启动故障时尝试 Connect under reset；
-- 确认下载地址从 `0x08000000` 开始；
-- 观察调用栈、寄存器和反汇编，不只看编辑器当前行。
-
----
-
-## 15. 建议的最终工程组织思路
-
-第一次保真运行通过后，可以再做结构整理。一个清晰的长期结构可以是：
+可采用以下目录结构：
 
 ```text
 Core/                    CubeIDE/CubeMX 维护的启动入口和系统文件
@@ -890,78 +442,15 @@ Drivers/BSP/LED/
 Drivers/BSP/LCD/
 ```
 
-整理原则：
+每次整理后重新执行第5章验收，便于定位由结构调整引入的问题。
 
-- 生成代码与手写代码边界明确；
-- 每个 `.c` 正常独立编译，逐步消除“包含 `.c` 文件”的做法；
-- HAL/CMSIS 只有一个版本来源；
-- 板级引脚集中定义；
-- 初始化函数的所有权唯一；
-- Debug/Release 构建配置中的宏和路径同步；
-- 工程不依赖个人电脑绝对路径。
+## 附录 C：其他场景的注意事项
 
-“先保真移植，再重构”并不意味着永远保留旧结构，而是让每一步都可以验证。若保真版本运行、重构版本不运行，差异范围就很小。
+- **短枚举与 ABI**：原 MDK 工程启用了短枚举相关选项，本实验通常无需机械加入 `-fshort-enums`；只有预编译库、通信结构或二进制格式依赖枚举尺寸时，才需核对一致性。
+- **Bootloader**：应用放到 Bootloader 后方时，Flash ORIGIN、可用 LENGTH、下载地址与 `SCB->VTOR` 必须配套修改。
+- **中断或多任务打印**：第4.2节示例为阻塞输出，用于这些场景前还需考虑阻塞时间与重入。
 
----
-
-## 16. 实验13移植检查清单
-
-### 构建前
-
-- [ ] 已验证原 MDK HEX 在当前硬件上可运行。
-- [ ] 目标 MCU 是 STM32F103ZETx，Cortex-M3，无 FPU。
-- [ ] 已决定使用原 HAL/CMSIS 还是 CubeIDE HAL/CMSIS，不混用。
-- [ ] 已确定源码采用复制还是链接方式。
-- [ ] 已记录原程序的 LCD ID、串口输出和 LED 现象。
-
-### 编译配置
-
-- [ ] Debug 和 Release 都定义了 `USE_HAL_DRIVER`、`STM32F103xE`。
-- [ ] 已加入 CMSIS、HAL Inc、`Drivers`、`User` 等头文件路径。
-- [ ] `stm32f1xx_hal_conf.h` 来自预期目录。
-- [ ] 文件编码按 GBK 打开，或已安全转换为 UTF-8。
-- [ ] 初次调试使用 `-Og/-O0`，之后再验证 `-O1` 或 Release。
-
-### 文件集合
-
-- [ ] 只编译 `.uvprojx` 中列出的实验源文件。
-- [ ] `main1.c`、`main2.c` 已排除。
-- [ ] `lcd_ex.c` 未被独立编译。
-- [ ] ARMASM 版本 `startup_stm32f103xe.s` 已排除。
-- [ ] 只有一个 `main()`、`SystemInit()` 和各中断入口。
-- [ ] HAL SRAM 与 LL FSMC 实现均已加入。
-
-### 启动和链接
-
-- [ ] 使用 STM32F103ZETx 对应的 GNU 启动文件。
-- [ ] Flash 为 `0x08000000/512K`，RAM 为 `0x20000000/64K`。
-- [ ] `.isr_vector` 位于 Flash 起始处且被 `KEEP()`。
-- [ ] 未把 FSMC LCD 地址错误地当作普通 RAM 段。
-- [ ] 需要时已启用 Intel HEX 输出。
-
-### 编译器适配
-
-- [ ] MDK 半主机代码只在 ARMCC 下编译。
-- [ ] GCC 下有且只有一套 `_write()` 或 `__io_putchar()` 路径。
-- [ ] FSMC 时序结构体已确定性初始化。
-- [ ] `sprintf` 已检查缓冲区大小和格式参数类型。
-
-### 运行验证
-
-- [ ] 能从 Reset_Handler 进入 main。
-- [ ] SYSCLK=72 MHz，APB1=36 MHz，APB2=72 MHz。
-- [ ] LED0 和 1 秒延时正确。
-- [ ] USART1 以 115200 输出正常。
-- [ ] FSMC 地址访问不产生 BusFault。
-- [ ] LCD ID 稳定且属于驱动支持范围。
-- [ ] LCD 背景色、字符串和 LED 行为符合原实验。
-- [ ] 冷启动、复位、Debug、Release 均做过验证。
-
----
-
-## 17. 可复用于其他 MDK 例程的移植模板
-
-迁移其他实验时，可按以下表格先做静态分析：
+## 附录 D：迁移其他 MDK 例程时的信息对照
 
 | 分类  | 要从 MDK 提取的内容                  | 在 CubeIDE 中的对应物                    |
 | --- | ----------------------------- | ---------------------------------- |
@@ -977,19 +466,8 @@ Drivers/BSP/LCD/
 | 外设  | 时钟、引脚、DMA、中断、外部器件             | 原驱动或 CubeMX 生成代码，二选一               |
 | 验收  | 原工程可观察现象                      | 分阶段硬件测试和回归标准                       |
 
-每次移植都应回答四个问题：
-
-1. **原工程究竟编译了什么？**
-2. **哪些内容属于编译器/IDE，不能直接复制？**
-3. **哪些硬件初始化已经由原代码完成，不能再生成一套？**
-4. **怎样用最小可观察现象证明每一层已经正确？**
-
-能够回答这四个问题，移植就从“碰运气改报错”变成了可重复的工程过程。
-
----
-
 ## 参考
 
-- 原工程配置：`实验13 TFTLCD（MCU屏）实验/Projects/MDK-ARM/atk_f103.uvprojx`
-- 原实验说明：`实验13 TFTLCD（MCU屏）实验/readme.txt`
-- ST 官方《STM32CubeIDE user guide（UM2609）》：<https://www.st.com/resource/en/user_manual/um2609-stm32cubeide-user-manual-stmicroelectronics.pdf>
+- 原工程配置：`2，标准例程-HAL库版本/实验13 TFTLCD（MCU屏）实验/Projects/MDK-ARM/atk_f103.uvprojx`
+- 原实验说明：`2，标准例程-HAL库版本/实验13 TFTLCD（MCU屏）实验/readme.txt`
+- ST 官方：[STM32CubeIDE user guide（UM2609）](https://www.st.com/resource/en/user_manual/um2609-stm32cubeide-user-manual-stmicroelectronics.pdf)
